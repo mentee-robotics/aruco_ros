@@ -49,6 +49,7 @@
 #include "tf2_ros/transform_listener.h"
 #include "tf2_ros/buffer.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
+#include "rclcpp/qos.hpp"
 
 using namespace std::chrono_literals;
 
@@ -71,6 +72,7 @@ private:
   // ROS pub-sub
   std::unique_ptr<image_transport::ImageTransport> it_;
   image_transport::Subscriber image_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;
 
   image_transport::Publisher image_pub_;
   image_transport::Publisher debug_pub_;
@@ -82,6 +84,7 @@ private:
   std::shared_ptr<aruco_msgs::msg::MarkerArray> marker_msg_;
   cv::Mat inImage_;
   bool useCamInfo_;
+  bool camera_info_obtained_ = false;
   std_msgs::msg::UInt32MultiArray marker_list_msg_;
 
 public:
@@ -104,22 +107,26 @@ public:
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     it_ = std::make_unique<image_transport::ImageTransport>(shared_from_this());
-    image_sub_ = it_->subscribe("/image", 1, &ArucoMarkerPublisher::image_callback, this);
+    image_sub_ = image_transport::create_subscription(
+      this, "/image", std::bind(&ArucoMarkerPublisher::image_callback, this, std::placeholders::_1),
+      "raw", rmw_qos_profile_sensor_data);
 
     this->get_parameter_or<bool>("use_camera_info", useCamInfo_, true);
     if (useCamInfo_) {
       RCLCPP_INFO(this->get_logger(), "Waiting for the camera info...");
       sensor_msgs::msg::CameraInfo camera_info;
-      rclcpp::wait_for_message<sensor_msgs::msg::CameraInfo>(
-        camera_info,
-        shared_from_this(), "/camera_info");
-      RCLCPP_INFO(this->get_logger(), "Successfully obtained the camera info!");
+
+      rclcpp::QoS qos(rclcpp::KeepLast(1));
+      qos.reliability(rclcpp::ReliabilityPolicy::BestEffort);
+      camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
+        "/camera_info", qos,
+        std::bind(&ArucoMarkerPublisher::camera_info_callback, this, std::placeholders::_1));
 
       this->get_parameter_or<double>("marker_size", marker_size_, 0.05);
       this->get_parameter_or<bool>("image_is_rectified", useRectifiedImages_, true);
       this->get_parameter_or<std::string>("reference_frame", reference_frame_, "");
       this->get_parameter_or<std::string>("camera_frame", camera_frame_, "");
-      camParam_ = aruco_ros::rosCameraInfo2ArucoCamParams(camera_info, useRectifiedImages_);
+
       rcpputils::assert_true(
         !(camera_frame_.empty() && !reference_frame_.empty()),
         "Either the camera frame is empty and also reference frame is empty..");
@@ -170,8 +177,22 @@ public:
     return true;
   }
 
-  void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & msg)
+  void camera_info_callback(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
   {
+    camParam_ = aruco_ros::rosCameraInfo2ArucoCamParams(*msg, useRectifiedImages_);
+    camera_info_obtained_ = true;
+    RCLCPP_INFO(this->get_logger(), "Camera info obtained!");
+  }
+
+  void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & msg)
+  { 
+    if (!camera_info_obtained_) {
+      RCLCPP_WARN(this->get_logger(), "Camera info not obtained yet, skipping image callback...");
+      return;
+    } else {
+      camera_info_sub_.reset();
+    }
+    
     bool publishMarkers = marker_pub_->get_subscription_count() > 0;
     bool publishMarkersList = marker_list_pub_->get_subscription_count() > 0;
     bool publishImage = image_pub_.getNumSubscribers() > 0;
